@@ -102,6 +102,7 @@ const tally = atom({ plugin: 'ultraguard', key: 'tally' } as const, createTally(
 
 const windowFrom = new Map<string, number>()
 const estimatedAt = new Map<string, number>()
+const NOTICE_ROWS = 40
 let ringHeld = true
 
 type Ids = { toolUseId: string; runId: string }
@@ -149,12 +150,6 @@ const tinted = (Text: any, text: string, color: string | undefined) =>
 
 function cap<V>(map: Map<string, V>) {
   while (map.size > KEPT) map.delete(map.keys().next().value as string)
-}
-
-function textOf(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content.map(b => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : '')).join('\n')
 }
 
 async function configDir($: EngineInterface): Promise<string | null> {
@@ -456,10 +451,24 @@ async function endOrphan($: EngineInterface, key: string, status: string, at: nu
   if (ended) await $.fs.write(path, `${JSON.stringify(ended, null, 2)}\n`)
 }
 
-async function reconcile($: EngineInterface) {
-  if (activeRuns(await read($, ev)).length === 0) return
-  const rows = await $.session.messages()
-  await endRuns($, rows.slice(-40).filter(r => r.role === 'user').flatMap(r => parseTaskNotifications(r.text)))
+let seen: string | undefined
+let scanning: Promise<void> = Promise.resolve()
+
+async function markSeen($: EngineInterface) {
+  const last = await $.session.messages({ last: 1 })
+  seen = 'deny' in last ? undefined : last.at(-1)?.uuid
+}
+
+function scanNotices($: EngineInterface): Promise<void> {
+  const run = scanning.then(async () => {
+    let rows = await $.session.messages(seen === undefined ? { last: NOTICE_ROWS } : { after: seen })
+    if ('deny' in rows) rows = await $.session.messages({ last: NOTICE_ROWS })
+    if ('deny' in rows) return
+    seen = rows.at(-1)?.uuid ?? seen
+    await endRuns($, rows.filter(r => r.role === 'user').flatMap(r => parseTaskNotifications(r.text)))
+  })
+  scanning = run.catch(() => undefined)
+  return run
 }
 
 export const register: Register = on => {
@@ -471,6 +480,7 @@ export const register: Register = on => {
       await update($, ev, s => noteLimit(s, limit))
     })
     dataLoad = null
+    await guard($, 'notices', () => markSeen($))
     await guard($, 'meter', () => loadMeter($))
     await guard($, 'tally', () => loadTally($))
     await guard($, 'context', async () => {
@@ -597,6 +607,7 @@ export const register: Register = on => {
         if (noteMainStep(before, args) !== before) await update($, ev, s => noteMainStep(s, args))
         if (before.main.model !== null && typeof e.model === 'string' && before.main.model !== e.model) await update($, ctx, forgetCompactRead)
       })
+      await guard($, 'notices', () => scanNotices($))
     }
     const result = yield* next(e)
     await guard($, 'usage', async () => {
@@ -621,7 +632,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const agentId = e.agentId
     if (agentId === undefined) {
-      await guard($, 'reconcile', () => reconcile($))
+      await guard($, 'notices', () => scanNotices($))
     } else {
       await guard($, 'complete', async () => {
         const before = await read($, ev)
@@ -635,14 +646,6 @@ export const register: Register = on => {
       })
     }
     return next(e)
-  })
-
-  on('session.append', async ($, e, next) => {
-    const done = await next(e)
-    if (e.agentId === undefined && e.message.type !== 'assistant') {
-      await guard($, 'notice', () => endRuns($, parseTaskNotifications(textOf(e.message.content))))
-    }
-    return done
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
