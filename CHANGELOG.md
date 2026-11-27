@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.21 - ultraguard
+
+- ultraguard-eval no longer hooks `session.append` to see a workflow's end. Where an organization seats a policy plugin (`cc-plugin-sec-default`), Claude Code sends that event past every user plugin, so the hook never ran and each session showed "ultraguard: its session.append hook was skipped". The mod now reads the main conversation's rows that are new since its last read (`$.session.messages({ after })`) before each main-thread model request and when a main turn ends, and ends runs from the `<task-notification>` rows it finds. A notice that starts a turn ends its run before the model reads it, as before.
+- Rows already in the conversation when the session starts or the mod reloads are not read as new notices. If the last row read is gone (cleared, rewound or compacted away), the mod reads the last 40 rows instead.
+- The end-of-turn check no longer waits for a running workflow, so a notice after a restart still ends the stored run in the session tally and its record.
+
 ## 0.4.20 - ultraguard
 
 - `code:` is now fully specified implementation on Haiku medium: the prompt names the files, the functions or interfaces and the test commands, and leaves nothing to decide. `build:` takes decided work that leaves details open (modules or ports from a plan, names, ownership, stored state), and `fix:` says a fix spelled out file by file is `code:`. A replay of 14 past Sonnet coding tasks found Haiku medium failing 1 of 33 runs where the prompt left nothing to decide (Sonnet 0 of 22) at 0.05 to 0.9 times the cost, and failing 5 of 8 where names, ownership or state rules were open (Sonnet 2 of 6).

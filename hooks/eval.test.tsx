@@ -38,6 +38,17 @@ const gateRecord = (toolUseId: string, over: Record<string, unknown> = {}) =>
     ...over,
   })
 
+const rowsOf = (rows: any[], e: any) => {
+  if (e.after === undefined) return e.last === undefined ? rows : rows.slice(-e.last)
+  const at = rows.findIndex(r => r.uuid === e.after)
+  return at < 0 ? { deny: `row ${e.after} is gone` } : rows.slice(at + 1)
+}
+const notice = (id: string, status: string, taskId?: string) => ({
+  role: 'user',
+  text: `<task-notification>\n${taskId ? `<task-id>${taskId}</task-id>\n` : ''}<tool-use-id>${id}</tool-use-id>\n<status>${status}</status>\n</task-notification>`,
+  toolUses: [],
+})
+
 const PRICES = { v: 1, families: { opus: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 }, sonnet: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 } } }
 const RATIOS = { v: 1, tau: 0.3, pooledAgentSd: { output: 0.4, fresh: 0.2, read: 0.6 }, measured: {}, steps: {}, priors: {} }
 
@@ -45,7 +56,7 @@ async function world($: any, on: any, options: { gate: boolean; launch?: Record<
   const writes: Record<string, string> = {}
   const logs: string[] = []
   const toasts: string[] = []
-  const notices: unknown[] = []
+  const notices: any[] = []
   let toolUseId = ''
   let launches = 0
   mock.env(on, { CLAUDE_CONFIG_DIR: CONFIG })
@@ -54,7 +65,7 @@ async function world($: any, on: any, options: { gate: boolean; launch?: Record<
   on('session.id', () => ({ value: SESSION }))
   on('session.end', () => ({ sessionId: SESSION }))
   on('turn.complete', () => ({ text: '' }))
-  on('session.messages', () => ({ value: notices }))
+  on('session.messages', (_: any, e: any) => ({ value: rowsOf(notices, e) }))
   on('ui.log', (_: any, e: any) => (logs.push(String(e.text)), { value: undefined }))
   on('ui.toast', (_: any, e: any) => (toasts.push(String(e.text)), { value: undefined }))
   on('fs.write', (_: any, e: any) => ((writes[e.path] = e.text), { value: undefined }))
@@ -114,13 +125,10 @@ async function world($: any, on: any, options: { gate: boolean; launch?: Record<
     await $.tool.call({ tool: 'Workflow', script: SCRIPT })
     return toolUseId
   }
-  const end = (id: string, status = 'completed') =>
-    $.session.append({
-      message: { type: 'user', content: [{ type: 'text', text: `<task-notification>\n<tool-use-id>${id}</tool-use-id>\n<status>${status}</status>\n</task-notification>` }] },
-      door: 'queue',
-      origin: { kind: 'task-notification' },
-      uuid: `u-${id}`,
-    })
+  const end = async (id: string, status = 'completed', taskId?: string) => {
+    notices.push({ ...notice(id, status, taskId), uuid: `u${notices.length + 1}` })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  }
   return { writes, logs, notices, toasts, id: () => toolUseId, spawn, launch, end }
 }
 
@@ -180,15 +188,7 @@ test('the pane lists the run and drills into its checks and agents', async ($, o
 
 test('a completion notice takes the run off the band and the list', async ($, on) => {
   const w = await world($, on, { gate: true })
-  await $.session.append({
-    message: {
-      type: 'user',
-      content: [{ type: 'text', text: `<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>${w.id()}</tool-use-id>\n<status>completed</status>\n</task-notification>` }],
-    },
-    door: 'queue',
-    origin: { kind: 'task-notification' },
-    uuid: 'u1',
-  })
+  await w.end(w.id(), 'completed', 'w1')
 
   const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await band.find({ type: 'Text', text: 'engine' })).toBeDefined()
@@ -304,16 +304,41 @@ test('a clear ends the running workflows', async ($, on) => {
   expect(record.status).toBe('cleared')
 })
 
-test('a completion notice the append hook never saw still ends the run at the next main turn', async ($, on) => {
+test('a completion notice ends the run at the next main model request, before the turn ends', async ($, on) => {
+  on('turn.step', async function* (_: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
   const w = await world($, on, { gate: true })
-  w.notices.push({ role: 'user', text: `<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>${w.id()}</tool-use-id>\n<status>killed</status>\n</task-notification>`, toolUses: [] })
-  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  w.notices.push({ ...notice(w.id(), 'killed', 'w1'), uuid: 'u1' })
+  await drain($.turn.step({ turnId: 't1', index: 0, model: SONNET, messageCount: 1 }))
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Button' })).toBeUndefined()
   await ui.unmount()
   const record = JSON.parse(w.writes[`${CONFIG}/ultraguard/sessions/${SESSION}/${w.id()}.eval.json`] ?? '{}')
   expect(record.status).toBe('killed')
+})
+
+test('rows already in the conversation at session start are not read as new notices', async ($, on) => {
+  on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
+  const w = await world($, on, { gate: true })
+  w.notices.push({ ...notice(w.id(), 'completed', 'w1'), uuid: 'u1' })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(await bandRunning($)).toContain('1 running')
+  await w.end(w.id(), 'killed', 'w1')
+  expect(await bandRunning($)).toBeNull()
+  expect(evalRecordOf(w).status).toBe('killed')
+})
+
+test('a notice is still read when the last row read is gone, as after a compaction', async ($, on) => {
+  const w = await world($, on, { gate: true })
+  w.notices.push({ role: 'user', text: 'hi', toolUses: [], uuid: 'u0' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  w.notices.splice(0)
+  await w.end(w.id(), 'completed', 'w1')
+  expect(await bandRunning($)).toBeNull()
+  expect(evalRecordOf(w).status).toBe('completed')
 })
 
 const stopRun = ($: any, input: Record<string, unknown>) => $.tool.call({ tool: 'TaskStop', ...input })
@@ -377,15 +402,7 @@ test('a TaskStop of another task, a denied one or a failed one leaves the workfl
 test('a notice after the TaskStop leaves the run stopped and toasts once', async ($, on) => {
   const w = await world($, on, { gate: true })
   await stopRun($, { task_id: 'w1' })
-  await $.session.append({
-    message: {
-      type: 'user',
-      content: [{ type: 'text', text: `<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>${w.id()}</tool-use-id>\n<status>completed</status>\n</task-notification>` }],
-    },
-    door: 'queue',
-    origin: { kind: 'task-notification' },
-    uuid: 'u1',
-  })
+  await w.end(w.id(), 'completed', 'w1')
   expect(evalRecordOf(w).status).toBe('killed')
   expect(w.toasts).toEqual(['ultraguard: map stopped'])
 })

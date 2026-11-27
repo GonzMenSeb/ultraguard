@@ -62,6 +62,12 @@ const drain = async (stream: AsyncGenerator<unknown, unknown>) => {
   return r.value
 }
 
+const rowsOf = (rows: any[], e: any) => {
+  if (e.after === undefined) return e.last === undefined ? rows : rows.slice(-e.last)
+  const at = rows.findIndex(r => r.uuid === e.after)
+  return at < 0 ? { deny: `row ${e.after} is gone` } : rows.slice(at + 1)
+}
+
 type Options = { subscription: boolean; context?: { tokens?: number }; compact?: number; gate?: boolean; agents?: number; readings?: number; finish?: boolean; complete?: boolean; launched?: boolean; preload?: Record<string, unknown>; now?: number; record?: Record<string, unknown>; name?: string; files?: Record<string, string> }
 
 async function flow($: any, on: any, options: Options) {
@@ -69,7 +75,7 @@ async function flow($: any, on: any, options: Options) {
   const writes: Record<string, string> = {}
   const toasts: string[] = []
   const store: Record<string, unknown> = { ...preload }
-  const notices: unknown[] = []
+  const notices: any[] = []
   let toolUseId = ''
   let percent = 10
   let spawned = 0
@@ -87,7 +93,7 @@ async function flow($: any, on: any, options: Options) {
     return { sessionId: ended }
   })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
-  on('session.messages', () => ({ value: notices }))
+  on('session.messages', (_: any, e: any) => ({ value: rowsOf(notices, e) }))
   let fill: Record<string, unknown> = { window: 200000, ...context }
   let hold: Promise<void> | null = null
   on('session.usage', async (_: any, e: any) => {
@@ -178,16 +184,15 @@ async function flow($: any, on: any, options: Options) {
     if (complete) await done('a1')
   }
   let notified = 0
-  const end = (id: string, status = 'completed') =>
-    $.session.append({
-      message: {
-        type: 'user',
-        content: [{ type: 'text', text: `<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>${id}</tool-use-id>\n<status>${status}</status>\n</task-notification>` }],
-      },
-      door: 'queue',
-      origin: { kind: 'task-notification' },
+  const end = async (id: string, status = 'completed') => {
+    notices.push({
+      role: 'user',
+      text: `<task-notification>\n<task-id>w1</task-id>\n<tool-use-id>${id}</tool-use-id>\n<status>${status}</status>\n</task-notification>`,
+      toolUses: [],
       uuid: `u${(notified += 1)}`,
     })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  }
   const launch = async () => {
     await $.tool.call({ tool: 'Workflow', script: SCRIPT })
     return toolUseId
